@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Generated analysis outputs
+gpu_analysis_full.csv
+bottleneck_report.md
+gpu_timeline.png
+results/
+analysis/
+profiles/
+sample_results/
+
+# Large profiler/database artifacts
+*.sqlite
+*.sqlite3
+*.db
+*.nsys-rep
+*.qdrep
