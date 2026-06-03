@@ -158,8 +158,8 @@ class NsightExtractor:
         for table, cols in self.columns.items():
             lower = {c.lower(): c for c in cols}
             id_col = self._pick(cols, ["id", "value", "enum"])
-            name_col = self._pick(cols, ["value", "name", "label", "text", "string"])
-            if not id_col or not name_col or id_col == name_col:
+            name_col = self._pick_name_col(cols, id_col)
+            if not id_col or not name_col:
                 continue
             table_lower = table.lower()
             if "string" in table_lower:
@@ -172,7 +172,12 @@ class NsightExtractor:
                 data = conn.execute(f"SELECT {self._quote(id_col)}, {self._quote(name_col)} FROM {self._quote(table)}").fetchall()
             except sqlite3.Error:
                 continue
-            mapped = {row[0]: str(row[1]) for row in data if row[0] is not None and row[1] is not None}
+            mapped: dict[Any, str] = {}
+            for row in data:
+                if row[0] is None or row[1] is None:
+                    continue
+                mapped[row[0]] = str(row[1])
+                mapped[self._normalize_key(row[0])] = str(row[1])
             if not mapped:
                 continue
             if "string" in table_lower:
@@ -328,10 +333,15 @@ class NsightExtractor:
     def _event_name(self, table: str, event_type: str, row: pd.Series, cols: list[str]) -> str:
         candidates = [
             "demangledName",
+            "demangledNameId",
             "shortName",
+            "shortNameId",
             "mangledName",
+            "mangledNameId",
             "name",
             "nameId",
+            "kernelName",
+            "kernelNameId",
             "text",
             "message",
             "messageId",
@@ -340,11 +350,23 @@ class NsightExtractor:
             "symbolName",
         ]
         if event_type == "cuda_api":
-            candidates = ["name", "nameId", "cbid", "eventClass", "api", "functionName"] + candidates
-        value = self._value(row, cols, candidates)
-        resolved = self._resolve_name(value, table, event_type)
-        if self._known(resolved):
-            return str(resolved)
+            candidates = ["name", "nameId", "cbid", "cbId", "eventClass", "api", "functionName", "runtimeName"] + candidates
+        numeric_fallback: Any = None
+        for candidate in candidates:
+            value = self._value(row, cols, [candidate])
+            if not self._known(value):
+                continue
+            resolved = self._resolve_name(value, table, event_type)
+            if self._is_good_name(resolved):
+                return str(resolved)
+            if numeric_fallback is None and self._known(resolved):
+                numeric_fallback = resolved
+        if numeric_fallback is not None:
+            if event_type == "cuda_api":
+                return f"CUDA API id {numeric_fallback}"
+            if event_type == "kernel":
+                return f"Kernel name id {numeric_fallback}"
+            return str(numeric_fallback)
         return {
             "kernel": "Unnamed GPU kernel",
             "memcpy": "GPU memory copy",
@@ -356,16 +378,23 @@ class NsightExtractor:
     def _resolve_name(self, value: Any, table: str, event_type: str) -> Any:
         if not self._known(value):
             return "N/A"
-        if isinstance(value, str) and not value.isdigit():
+        key = self._normalize_key(value)
+        if isinstance(value, str) and not value.strip().isdigit():
             return value
         for enum_table, mapping in self.enum_maps.items():
             low = enum_table.lower()
             if event_type == "cuda_api" and ("runtime" in low or "driver" in low or "cuda" in low):
+                if key in mapping:
+                    return mapping[key]
                 if value in mapping:
                     return mapping[value]
+        if key in self.string_maps:
+            return self.string_maps[key]
         if value in self.string_maps:
             return self.string_maps[value]
         for mapping in self.enum_maps.values():
+            if key in mapping:
+                return mapping[key]
             if value in mapping:
                 return mapping[value]
         return value
@@ -389,14 +418,40 @@ class NsightExtractor:
     def _resolve_copy_kind(self, raw: Any) -> Any:
         if not self._known(raw):
             return "unknown"
-        if isinstance(raw, str) and not raw.isdigit():
+        key = self._normalize_key(raw)
+        if isinstance(raw, str) and not raw.strip().isdigit():
             return raw
         for enum_table, mapping in self.enum_maps.items():
             low = enum_table.lower()
             if "memcpy" in low or "copy" in low:
+                if key in mapping:
+                    return mapping[key]
                 if raw in mapping:
                     return mapping[raw]
         return raw
+
+    @staticmethod
+    def _normalize_key(value: Any) -> Any:
+        try:
+            if pd.isna(value):
+                return value
+        except TypeError:
+            pass
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+    @staticmethod
+    def _is_good_name(value: Any) -> bool:
+        if not NsightExtractor._known(value):
+            return False
+        text = str(value).strip()
+        if text.isdigit():
+            return False
+        if text.lower() in {"unknown", "none", "null"}:
+            return False
+        return True
 
     def _blank_event(self) -> dict[str, Any]:
         return {col: "N/A" for col in NORMALIZED_COLUMNS}
@@ -416,6 +471,14 @@ class NsightExtractor:
             key = re.sub(r"[^a-z0-9]", "", name.lower())
             if key in compact:
                 return compact[key]
+        return None
+
+    @staticmethod
+    def _pick_name_col(cols: list[str], id_col: str | None) -> str | None:
+        for names in (["name", "label", "text", "string"], ["value"]):
+            col = NsightExtractor._pick(cols, names)
+            if col and col != id_col:
+                return col
         return None
 
     def _value(self, row: pd.Series, cols: list[str], names: list[str]) -> Any:

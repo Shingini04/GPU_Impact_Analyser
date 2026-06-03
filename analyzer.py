@@ -275,9 +275,9 @@ def _add_gpu_relationships(events: pd.DataFrame, gpu: pd.DataFrame, profile_star
 
 def _kernel_summary(kernels: pd.DataFrame, total_ns: int) -> pd.DataFrame:
     if kernels.empty:
-        return pd.DataFrame(columns=["rank", "kernel_name", "calls", "total_ms", "avg_ms", "max_ms", "streams", "grid", "block", "pct_kernel_time", "pct_total_time", "simple_meaning"])
+        return pd.DataFrame(columns=["kernel_name", "calls", "total_ms", "avg_ms", "max_ms", "streams", "grid", "block", "pct_kernel_time", "pct_total_time"])
     total_kernel = max(kernels["duration_ns"].sum(), 1)
-    grouped = kernels.groupby("simple_name", dropna=False).agg(
+    grouped = kernels.groupby("name", dropna=False).agg(
         calls=("event_id", "count"),
         total_ns=("duration_ns", "sum"),
         avg_ns=("duration_ns", "mean"),
@@ -285,19 +285,14 @@ def _kernel_summary(kernels: pd.DataFrame, total_ns: int) -> pd.DataFrame:
         streams=("stream_id", lambda x: ", ".join(sorted(set(map(str, x))))),
         grid=("grid_x", lambda x: " / ".join(sorted(set(_grid_block(kernels.loc[x.index], "grid"))))[:120]),
         block=("block_x", lambda x: " / ".join(sorted(set(_grid_block(kernels.loc[x.index], "block"))))[:120]),
-    ).reset_index().rename(columns={"simple_name": "kernel_name"})
+    ).reset_index().rename(columns={"name": "kernel_name"})
     grouped["total_ms"] = grouped["total_ns"] / 1_000_000
     grouped["avg_ms"] = grouped["avg_ns"] / 1_000_000
     grouped["max_ms"] = grouped["max_ns"] / 1_000_000
     grouped["pct_kernel_time"] = grouped["total_ns"] / total_kernel * 100
     grouped["pct_total_time"] = grouped["total_ns"] / total_ns * 100
     grouped = grouped.sort_values("total_ns", ascending=False).reset_index(drop=True)
-    grouped["rank"] = np.arange(1, len(grouped) + 1)
-    grouped["simple_meaning"] = grouped.apply(
-        lambda r: "This kernel is a top time consumer." if r["rank"] == 1 else ("This kernel is launched many times." if r["calls"] >= 10 else "GPU work measured on the timeline."),
-        axis=1,
-    )
-    return grouped[["rank", "kernel_name", "calls", "total_ms", "avg_ms", "max_ms", "streams", "grid", "block", "pct_kernel_time", "pct_total_time", "simple_meaning"]]
+    return grouped[["kernel_name", "calls", "total_ms", "avg_ms", "max_ms", "streams", "grid", "block", "pct_kernel_time", "pct_total_time"]]
 
 
 def _grid_block(rows: pd.DataFrame, prefix: str) -> list[str]:
@@ -315,8 +310,8 @@ def _grid_block(rows: pd.DataFrame, prefix: str) -> list[str]:
 def _api_summary(api: pd.DataFrame) -> pd.DataFrame:
     if api.empty:
         return pd.DataFrame(columns=["rank", "api_name", "calls", "total_ms", "avg_ms", "max_ms", "category", "simple_meaning"])
-    grouped = api.groupby("simple_name", dropna=False).agg(calls=("event_id", "count"), total_ns=("duration_ns", "sum"), avg_ns=("duration_ns", "mean"), max_ns=("duration_ns", "max")).reset_index()
-    grouped = grouped.rename(columns={"simple_name": "api_name"}).sort_values("total_ns", ascending=False).reset_index(drop=True)
+    grouped = api.groupby("name", dropna=False).agg(calls=("event_id", "count"), total_ns=("duration_ns", "sum"), avg_ns=("duration_ns", "mean"), max_ns=("duration_ns", "max")).reset_index()
+    grouped = grouped.rename(columns={"name": "api_name"}).sort_values("total_ns", ascending=False).reset_index(drop=True)
     grouped["rank"] = np.arange(1, len(grouped) + 1)
     grouped["total_ms"] = grouped["total_ns"] / 1_000_000
     grouped["avg_ms"] = grouped["avg_ns"] / 1_000_000
