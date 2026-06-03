@@ -363,9 +363,9 @@ class NsightExtractor:
                 numeric_fallback = resolved
         if numeric_fallback is not None:
             if event_type == "cuda_api":
-                return f"CUDA API id {numeric_fallback}"
+                return "Unresolved CUDA API call"
             if event_type == "kernel":
-                return f"Kernel name id {numeric_fallback}"
+                return "Unresolved GPU kernel name"
             return str(numeric_fallback)
         return {
             "kernel": "Unnamed GPU kernel",
