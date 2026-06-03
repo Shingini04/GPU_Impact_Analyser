@@ -1,473 +1,511 @@
-"""SQLite extraction for GPU Impact Analyser."""
-
 from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
-MEMCPY_KIND_MAP = {
-    0: ("unknown", "Unknown"),
-    1: ("H2D", "Host to Device"),
-    2: ("D2H", "Device to Host"),
-    3: ("H2A", "Host to Array"),
-    4: ("A2H", "Array to Host"),
-    5: ("A2A", "Array to Array"),
-    6: ("A2D", "Array to Device"),
-    7: ("D2A", "Device to Array"),
-    8: ("D2D", "Device to Device"),
-    9: ("H2H", "Host to Host"),
-    10: ("P2P", "Peer to Peer"),
-    11: ("H2D", "Unified Host to Device"),
-    12: ("D2H", "Unified Device to Host"),
-    13: ("D2D", "Unified Device to Device"),
-}
-
-
-@dataclass(frozen=True)
-class ColumnInfo:
-    name: str
-    type: str
+NORMALIZED_COLUMNS = [
+    "event_id",
+    "event_type",
+    "name",
+    "simple_name",
+    "start_ns",
+    "end_ns",
+    "duration_ns",
+    "duration_us",
+    "duration_ms",
+    "relative_start_ms",
+    "relative_end_ms",
+    "stream_id",
+    "device_id",
+    "context_id",
+    "process_id",
+    "thread_id",
+    "correlation_id",
+    "api_name",
+    "linked_api_event_id",
+    "api_start_ns",
+    "api_end_ns",
+    "api_duration_ns",
+    "launch_delay_ns",
+    "launch_delay_ms",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+    "block_x",
+    "block_y",
+    "block_z",
+    "bytes",
+    "bytes_readable",
+    "copy_direction",
+    "bandwidth_GBps",
+    "is_kernel",
+    "is_memcpy",
+    "is_memset",
+    "is_cuda_api",
+    "is_sync",
+    "is_allocation",
+    "is_idle_gap",
+    "previous_gpu_event",
+    "next_gpu_event",
+    "gap_before_ms",
+    "gap_after_ms",
+    "overlaps_with_other_gpu_work",
+    "stream_order",
+    "global_order",
+    "time_percent_of_total",
+    "time_percent_of_gpu_activity",
+    "bottleneck_tags",
+    "kid_explanation",
+]
 
 
 @dataclass
 class ExtractionResult:
-    sqlite_path: Path
-    tables: dict[str, list[ColumnInfo]]
     events: pd.DataFrame
-    warnings: list[str]
+    tables_found: list[str]
+    table_columns: dict[str, list[str]]
+    warnings: list[str] = field(default_factory=list)
+    missing_tables: list[str] = field(default_factory=list)
+    unavailable_fields: list[str] = field(default_factory=list)
+    string_tables: list[str] = field(default_factory=list)
+    enum_tables: list[str] = field(default_factory=list)
+    source_path: str = ""
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    uri = f"file:{path.resolve()}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+class NsightExtractor:
+    def __init__(self, sqlite_path: Path):
+        self.sqlite_path = Path(sqlite_path)
+        self.warnings: list[str] = []
+        self.unavailable_fields: list[str] = []
+        self.tables: list[str] = []
+        self.columns: dict[str, list[str]] = {}
+        self.string_maps: dict[str, str] = {}
+        self.enum_maps: dict[str, dict[Any, str]] = {}
+        self.enum_tables: list[str] = []
+        self.string_tables: list[str] = []
 
+    def extract(self) -> ExtractionResult:
+        with sqlite3.connect(str(self.sqlite_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            self._inspect_schema(conn)
+            self._load_name_maps(conn)
 
-def _list_tables(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    ).fetchall()
-    return [str(row[0]) for row in rows]
+            events: list[dict[str, Any]] = []
+            for table in self._find_tables("api"):
+                events.extend(self._extract_table(conn, table, "cuda_api"))
+            for table in self._find_tables("kernel"):
+                events.extend(self._extract_table(conn, table, "kernel"))
+            for table in self._find_tables("memcpy"):
+                events.extend(self._extract_table(conn, table, "memcpy"))
+            for table in self._find_tables("memset"):
+                events.extend(self._extract_table(conn, table, "memset"))
+            for table in self._find_tables("nvtx"):
+                events.extend(self._extract_table(conn, table, "nvtx"))
 
+        missing = []
+        for category in ["CUDA API/runtime", "GPU kernel", "GPU memcpy", "GPU memset", "NVTX"]:
+            key = category.split()[0].lower() if category != "CUDA API/runtime" else "api"
+            if category == "GPU kernel":
+                key = "kernel"
+            elif category == "GPU memcpy":
+                key = "memcpy"
+            elif category == "GPU memset":
+                key = "memset"
+            elif category == "NVTX":
+                key = "nvtx"
+            if not self._find_tables(key):
+                missing.append(category)
 
-def _columns(conn: sqlite3.Connection, table: str) -> list[ColumnInfo]:
-    return [ColumnInfo(name=row[1], type=row[2] or "") for row in conn.execute(f'PRAGMA table_info("{table}")')]
+        frame = pd.DataFrame(events)
+        if frame.empty:
+            frame = pd.DataFrame(columns=NORMALIZED_COLUMNS)
+        frame = self._finalize_events(frame)
 
+        if not frame.empty and not frame[["is_kernel", "is_memcpy", "is_memset", "is_cuda_api"]].any(axis=None):
+            self.warnings.append("No CUDA timeline data was recognized. The SQLite may not be an Nsight Systems export or may use an unsupported schema.")
 
-def _column_set(columns: list[ColumnInfo]) -> set[str]:
-    return {column.name for column in columns}
-
-
-def _pick(columns: set[str], *candidates: str) -> str | None:
-    lower = {column.lower(): column for column in columns}
-    for candidate in candidates:
-        found = lower.get(candidate.lower())
-        if found:
-            return found
-    return None
-
-
-def _contains_time_columns(columns: set[str]) -> bool:
-    return _pick(columns, "start", "startNs", "start_ns") is not None and _pick(columns, "end", "endNs", "end_ns") is not None
-
-
-def _matching_tables(
-    table_columns: dict[str, list[ColumnInfo]],
-    patterns: list[str],
-    exclude_patterns: list[str] | None = None,
-) -> list[str]:
-    matches = []
-    exclude_patterns = exclude_patterns or []
-    for table, columns in table_columns.items():
-        text = table.lower() + " " + " ".join(column.name.lower() for column in columns)
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in exclude_patterns):
-            continue
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns) and _contains_time_columns(_column_set(columns)):
-            matches.append(table)
-    return matches
-
-
-def _string_id_map(conn: sqlite3.Connection, table_columns: dict[str, list[ColumnInfo]]) -> dict[int, str]:
-    for table, columns in table_columns.items():
-        text = table.lower() + " " + " ".join(column.name.lower() for column in columns)
-        if not re.search(r"string.*id|stringids?", text, re.IGNORECASE):
-            continue
-        names = _column_set(columns)
-        id_col = _pick(names, "id")
-        value_col = _pick(names, "value", "string", "name")
-        if not id_col or not value_col:
-            continue
-        try:
-            return {
-                int(row[0]): str(row[1])
-                for row in conn.execute(f'SELECT "{id_col}", "{value_col}" FROM "{table}"')
-                if row[0] is not None and row[1] is not None
-            }
-        except sqlite3.Error:
-            continue
-    return {}
-
-
-def _safe_select(conn: sqlite3.Connection, table: str, columns: list[str]) -> list[sqlite3.Row]:
-    quoted = ", ".join(f'"{column}"' for column in columns)
-    try:
-        return conn.execute(f'SELECT {quoted} FROM "{table}" WHERE "{columns[1]}" > "{columns[0]}"').fetchall()
-    except sqlite3.Error:
-        return conn.execute(f'SELECT {quoted} FROM "{table}"').fetchall()
-
-
-def _resolve_name(value: Any, strings: dict[int, str], fallback: str) -> str:
-    if value is None:
-        return fallback
-    try:
-        number = int(value)
-        if number in strings:
-            return strings[number]
-    except (TypeError, ValueError):
-        pass
-    return str(value)
-
-
-def _number(value: Any) -> Any:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return value
-
-
-def _base_event(
-    event_type: str,
-    name: str,
-    table: str,
-    values: dict[str, Any],
-    start_col: str,
-    end_col: str,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    try:
-        start = int(values[start_col])
-        end = int(values[end_col])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if end < start:
-        return None
-    duration = end - start
-    row = {
-        "event_type": event_type,
-        "name": name,
-        "start_ns": start,
-        "end_ns": end,
-        "duration_ns": duration,
-        "duration_us": duration / 1_000.0,
-        "duration_ms": duration / 1_000_000.0,
-        "source_table": table,
-        "process_id": None,
-        "thread_id": None,
-        "device_id": None,
-        "context_id": None,
-        "stream_id": None,
-        "correlation_id": None,
-        "grid_x": None,
-        "grid_y": None,
-        "grid_z": None,
-        "block_x": None,
-        "block_y": None,
-        "block_z": None,
-        "registers_per_thread_if_available_from_nsys": None,
-        "shared_memory_if_available_from_nsys": None,
-        "bytes": None,
-        "copy_kind": None,
-        "copy_direction": None,
-        "memory_operation_type": None,
-        "raw_extra": extra or {},
-    }
-    return row
-
-
-def _fill_common(row: dict[str, Any], values: dict[str, Any], columns: set[str]) -> None:
-    picks = {
-        "process_id": ("processId", "globalPid", "pid"),
-        "thread_id": ("globalTid", "threadId", "tid"),
-        "device_id": ("deviceId", "device_id"),
-        "context_id": ("contextId", "context_id"),
-        "stream_id": ("streamId", "stream_id"),
-        "correlation_id": ("correlationId", "correlation_id"),
-    }
-    for target, candidates in picks.items():
-        col = _pick(columns, *candidates)
-        if col:
-            row[target] = _number(values.get(col))
-
-
-def _select_columns(columns: set[str], required: list[str], optional: list[str | None]) -> list[str]:
-    selected = list(required)
-    for column in optional:
-        if column and column not in selected:
-            selected.append(column)
-    return selected
-
-
-def _extract_kernel_events(
-    conn: sqlite3.Connection,
-    table_columns: dict[str, list[ColumnInfo]],
-    strings: dict[int, str],
-    warnings: list[str],
-) -> list[dict[str, Any]]:
-    tables = _matching_tables(table_columns, [r"cupti.*kernel", r"activity.*kernel", r"\bkernel\b"], [r"api", r"enum"])
-    if not tables:
-        warnings.append("No CUDA kernel activity table was found.")
-        return []
-    events = []
-    for table in tables:
-        columns = _column_set(table_columns[table])
-        start_col = _pick(columns, "start", "startNs", "start_ns")
-        end_col = _pick(columns, "end", "endNs", "end_ns")
-        if not start_col or not end_col:
-            continue
-        name_col = _pick(columns, "shortName", "demangledName", "mangledName", "nameId", "name")
-        optional = [
-            name_col,
-            _pick(columns, "processId", "globalPid", "pid"),
-            _pick(columns, "globalTid", "threadId", "tid"),
-            _pick(columns, "deviceId", "device_id"),
-            _pick(columns, "contextId", "context_id"),
-            _pick(columns, "streamId", "stream_id"),
-            _pick(columns, "correlationId", "correlation_id"),
-            _pick(columns, "gridX", "grid_x"),
-            _pick(columns, "gridY", "grid_y"),
-            _pick(columns, "gridZ", "grid_z"),
-            _pick(columns, "blockX", "block_x"),
-            _pick(columns, "blockY", "block_y"),
-            _pick(columns, "blockZ", "block_z"),
-            _pick(columns, "registersPerThread", "registers_per_thread"),
-            _pick(columns, "staticSharedMemory", "dynamicSharedMemory", "sharedMemoryExecuted", "shared_memory"),
-        ]
-        select_cols = _select_columns(columns, [start_col, end_col], optional)
-        for raw in _safe_select(conn, table, select_cols):
-            values = dict(zip(select_cols, raw))
-            name = _resolve_name(values.get(name_col), strings, "CUDA kernel") if name_col else "CUDA kernel"
-            row = _base_event("KERNEL", name, table, values, start_col, end_col)
-            if not row:
-                continue
-            _fill_common(row, values, columns)
-            for target, candidates in {
-                "grid_x": ("gridX", "grid_x"),
-                "grid_y": ("gridY", "grid_y"),
-                "grid_z": ("gridZ", "grid_z"),
-                "block_x": ("blockX", "block_x"),
-                "block_y": ("blockY", "block_y"),
-                "block_z": ("blockZ", "block_z"),
-                "registers_per_thread_if_available_from_nsys": ("registersPerThread", "registers_per_thread"),
-                "shared_memory_if_available_from_nsys": ("staticSharedMemory", "dynamicSharedMemory", "sharedMemoryExecuted", "shared_memory"),
-            }.items():
-                col = _pick(columns, *candidates)
-                if col:
-                    row[target] = _number(values.get(col))
-            events.append(row)
-    return events
-
-
-def _extract_memcpy_events(
-    conn: sqlite3.Connection,
-    table_columns: dict[str, list[ColumnInfo]],
-    warnings: list[str],
-) -> list[dict[str, Any]]:
-    tables = _matching_tables(table_columns, [r"cupti.*memcpy", r"activity.*memcpy", r"\bmemcpy\b"], [r"api", r"enum"])
-    if not tables:
-        warnings.append("No CUDA memcpy activity table was found.")
-        return []
-    events = []
-    for table in tables:
-        columns = _column_set(table_columns[table])
-        start_col = _pick(columns, "start", "startNs", "start_ns")
-        end_col = _pick(columns, "end", "endNs", "end_ns")
-        if not start_col or not end_col:
-            continue
-        kind_col = _pick(columns, "copyKind", "copy_kind", "kind")
-        bytes_col = _pick(columns, "bytes", "size", "numBytes")
-        select_cols = _select_columns(
-            columns,
-            [start_col, end_col],
-            [
-                kind_col,
-                bytes_col,
-                _pick(columns, "processId", "globalPid", "pid"),
-                _pick(columns, "globalTid", "threadId", "tid"),
-                _pick(columns, "deviceId", "device_id"),
-                _pick(columns, "contextId", "context_id"),
-                _pick(columns, "streamId", "stream_id"),
-                _pick(columns, "correlationId", "correlation_id"),
-            ],
+        return ExtractionResult(
+            events=frame,
+            tables_found=self.tables,
+            table_columns=self.columns,
+            warnings=sorted(set(self.warnings)),
+            missing_tables=missing,
+            unavailable_fields=sorted(set(self.unavailable_fields)),
+            string_tables=self.string_tables,
+            enum_tables=self.enum_tables,
+            source_path=str(self.sqlite_path),
         )
-        for raw in _safe_select(conn, table, select_cols):
-            values = dict(zip(select_cols, raw))
+
+    def _inspect_schema(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+        self.tables = [r[0] for r in rows]
+        for table in self.tables:
             try:
-                kind_int = int(values.get(kind_col)) if kind_col else 0
-            except (TypeError, ValueError):
-                kind_int = 0
-            direction, kind_name = MEMCPY_KIND_MAP.get(kind_int, ("unknown", "Unknown"))
-            row = _base_event("MEMCPY", f"Memcpy {direction}", table, values, start_col, end_col, {"copy_kind_raw": values.get(kind_col)})
-            if not row:
+                info = conn.execute(f"PRAGMA table_info({self._quote(table)})").fetchall()
+                self.columns[table] = [row[1] for row in info]
+            except sqlite3.Error as exc:
+                self.warnings.append(f"Could not inspect table {table}: {exc}")
+                self.columns[table] = []
+
+    def _load_name_maps(self, conn: sqlite3.Connection) -> None:
+        for table, cols in self.columns.items():
+            lower = {c.lower(): c for c in cols}
+            id_col = self._pick(cols, ["id", "value", "enum"])
+            name_col = self._pick(cols, ["value", "name", "label", "text", "string"])
+            if not id_col or not name_col or id_col == name_col:
                 continue
-            _fill_common(row, values, columns)
-            row["copy_kind"] = kind_int if kind_col else None
-            row["copy_direction"] = direction
-            row["memory_operation_type"] = kind_name
-            if bytes_col:
-                row["bytes"] = _number(values.get(bytes_col))
-            events.append(row)
-    return events
-
-
-def _extract_memset_events(conn: sqlite3.Connection, table_columns: dict[str, list[ColumnInfo]], warnings: list[str]) -> list[dict[str, Any]]:
-    tables = _matching_tables(table_columns, [r"cupti.*memset", r"activity.*memset", r"\bmemset\b"], [r"api", r"enum"])
-    if not tables:
-        warnings.append("No CUDA memset activity table was found.")
-        return []
-    events = []
-    for table in tables:
-        columns = _column_set(table_columns[table])
-        start_col = _pick(columns, "start", "startNs", "start_ns")
-        end_col = _pick(columns, "end", "endNs", "end_ns")
-        if not start_col or not end_col:
-            continue
-        bytes_col = _pick(columns, "bytes", "size", "numBytes")
-        select_cols = _select_columns(
-            columns,
-            [start_col, end_col],
-            [
-                bytes_col,
-                _pick(columns, "processId", "globalPid", "pid"),
-                _pick(columns, "globalTid", "threadId", "tid"),
-                _pick(columns, "deviceId", "device_id"),
-                _pick(columns, "contextId", "context_id"),
-                _pick(columns, "streamId", "stream_id"),
-                _pick(columns, "correlationId", "correlation_id"),
-            ],
-        )
-        for raw in _safe_select(conn, table, select_cols):
-            values = dict(zip(select_cols, raw))
-            row = _base_event("MEMSET", "Memset", table, values, start_col, end_col)
-            if not row:
+            table_lower = table.lower()
+            if "string" in table_lower:
+                self.string_tables.append(table)
+            if table_lower.startswith("enum") or "enum" in table_lower:
+                self.enum_tables.append(table)
+            if not ("string" in table_lower or "enum" in table_lower or lower.get("name")):
                 continue
-            _fill_common(row, values, columns)
-            row["memory_operation_type"] = "Memset"
-            if bytes_col:
-                row["bytes"] = _number(values.get(bytes_col))
-            events.append(row)
-    return events
-
-
-def _extract_api_events(
-    conn: sqlite3.Connection,
-    table_columns: dict[str, list[ColumnInfo]],
-    strings: dict[int, str],
-    warnings: list[str],
-) -> list[dict[str, Any]]:
-    tables = _matching_tables(table_columns, [r"cupti.*runtime", r"cupti.*driver", r"runtime.*api", r"driver.*api"], [r"enum"])
-    if not tables:
-        warnings.append("No CUDA runtime/driver API table was found.")
-        return []
-    events = []
-    for table in tables:
-        columns = _column_set(table_columns[table])
-        start_col = _pick(columns, "start", "startNs", "start_ns")
-        end_col = _pick(columns, "end", "endNs", "end_ns")
-        if not start_col or not end_col:
-            continue
-        name_col = _pick(columns, "nameId", "name", "cbid")
-        select_cols = _select_columns(
-            columns,
-            [start_col, end_col],
-            [
-                name_col,
-                _pick(columns, "processId", "globalPid", "pid"),
-                _pick(columns, "globalTid", "threadId", "tid"),
-                _pick(columns, "correlationId", "correlation_id"),
-            ],
-        )
-        for raw in _safe_select(conn, table, select_cols):
-            values = dict(zip(select_cols, raw))
-            name = _resolve_name(values.get(name_col), strings, "CUDA API") if name_col else "CUDA API"
-            row = _base_event("CUDA_API", name, table, values, start_col, end_col)
-            if not row:
+            try:
+                data = conn.execute(f"SELECT {self._quote(id_col)}, {self._quote(name_col)} FROM {self._quote(table)}").fetchall()
+            except sqlite3.Error:
                 continue
-            _fill_common(row, values, columns)
-            events.append(row)
-    return events
-
-
-def _extract_nvtx_events(
-    conn: sqlite3.Connection,
-    table_columns: dict[str, list[ColumnInfo]],
-    strings: dict[int, str],
-    warnings: list[str],
-) -> list[dict[str, Any]]:
-    tables = _matching_tables(table_columns, [r"\bnvtx\b", r"nvtx.*event"], [])
-    if not tables:
-        warnings.append("No NVTX range table was found.")
-        return []
-    events = []
-    for table in tables:
-        columns = _column_set(table_columns[table])
-        start_col = _pick(columns, "start", "startNs", "start_ns")
-        end_col = _pick(columns, "end", "endNs", "end_ns")
-        if not start_col or not end_col:
-            continue
-        name_col = _pick(columns, "text", "name", "message")
-        text_id_col = _pick(columns, "textId", "nameId")
-        select_cols = _select_columns(
-            columns,
-            [start_col, end_col],
-            [
-                name_col,
-                text_id_col,
-                _pick(columns, "processId", "globalPid", "pid"),
-                _pick(columns, "globalTid", "threadId", "tid"),
-            ],
-        )
-        for raw in _safe_select(conn, table, select_cols):
-            values = dict(zip(select_cols, raw))
-            name_value = values.get(name_col) if name_col else values.get(text_id_col) if text_id_col else None
-            name = _resolve_name(name_value, strings, "NVTX range")
-            row = _base_event("NVTX", name, table, values, start_col, end_col)
-            if not row:
+            mapped = {row[0]: str(row[1]) for row in data if row[0] is not None and row[1] is not None}
+            if not mapped:
                 continue
-            _fill_common(row, values, columns)
-            events.append(row)
-    return events
+            if "string" in table_lower:
+                self.string_maps.update(mapped)
+            self.enum_maps[table] = mapped
 
+    def _find_tables(self, category: str) -> list[str]:
+        found = []
+        for table in self.tables:
+            name = table.lower()
+            if name.startswith("enum") or name.startswith("sqlite_"):
+                continue
+            if category == "api":
+                if ("runtime" in name and ("cupti" in name or "cuda" in name)) or "cuda_api" in name or "api_call" in name:
+                    found.append(table)
+            elif category == "kernel":
+                if "kernel" in name and ("activity" in name or "cupti" in name or "gpu" in name):
+                    found.append(table)
+            elif category == "memcpy":
+                if "memcpy" in name and ("activity" in name or "cupti" in name or "gpu" in name):
+                    found.append(table)
+            elif category == "memset":
+                if "memset" in name and ("activity" in name or "cupti" in name or "gpu" in name):
+                    found.append(table)
+            elif category == "nvtx":
+                if "nvtx" in name and not name.startswith("enum"):
+                    found.append(table)
+        return sorted(set(found))
 
-def extract(sqlite_path: str | Path) -> ExtractionResult:
-    path = Path(sqlite_path)
-    warnings: list[str] = []
-    if not path.exists():
-        raise FileNotFoundError(f"SQLite file not found: {path}")
+    def _extract_table(self, conn: sqlite3.Connection, table: str, event_type: str) -> list[dict[str, Any]]:
+        try:
+            data = pd.read_sql_query(f"SELECT * FROM {self._quote(table)}", conn)
+        except Exception as exc:
+            self.warnings.append(f"Could not read table {table}: {exc}")
+            return []
+        if data.empty:
+            return []
 
-    with _connect(path) as conn:
-        table_names = _list_tables(conn)
-        table_columns = {table: _columns(conn, table) for table in table_names}
-        strings = _string_id_map(conn, table_columns)
-        if not strings:
-            warnings.append("No StringIds-style name table was found; numeric names may remain unresolved.")
-        events: list[dict[str, Any]] = []
-        events.extend(_extract_kernel_events(conn, table_columns, strings, warnings))
-        events.extend(_extract_memcpy_events(conn, table_columns, warnings))
-        events.extend(_extract_memset_events(conn, table_columns, warnings))
-        events.extend(_extract_api_events(conn, table_columns, strings, warnings))
-        events.extend(_extract_nvtx_events(conn, table_columns, strings, warnings))
+        cols = list(data.columns)
+        start_col = self._pick(cols, ["start", "start_ns", "startTime", "timestamp"])
+        end_col = self._pick(cols, ["end", "end_ns", "endTime"])
+        duration_col = self._pick(cols, ["duration", "duration_ns", "elapsed"])
+        if not start_col:
+            self.warnings.append(f"Skipped {table}: no usable start-time column.")
+            return []
+        if not end_col and not duration_col:
+            self.warnings.append(f"Skipped {table}: no usable end-time or duration column.")
+            return []
 
-    df = pd.DataFrame(events)
-    if not df.empty:
-        df = df.sort_values(["start_ns", "end_ns", "event_type"]).reset_index(drop=True)
-    return ExtractionResult(sqlite_path=path, tables=table_columns, events=df, warnings=warnings)
+        records: list[dict[str, Any]] = []
+        for idx, row in data.iterrows():
+            start = self._to_int(row.get(start_col))
+            end = self._to_int(row.get(end_col)) if end_col else None
+            duration = self._to_int(row.get(duration_col)) if duration_col else None
+            if end is None and start is not None and duration is not None:
+                end = start + duration
+            if duration is None and start is not None and end is not None:
+                duration = end - start
+            if start is None or end is None or duration is None or duration < 0:
+                continue
+
+            name = self._event_name(table, event_type, row, cols)
+            correlation = self._value(row, cols, ["correlationId", "correlation_id", "correlation"])
+            bytes_value = self._to_int(self._value(row, cols, ["bytes", "numBytes", "size", "memorySize", "memSize"]))
+            copy_direction = self._copy_direction(table, row, cols) if event_type == "memcpy" else "N/A"
+            api_name = name if event_type == "cuda_api" else "N/A"
+            is_sync = bool(event_type == "cuda_api" and self._is_sync_api(name))
+            is_allocation = bool(event_type == "cuda_api" and self._is_allocation_api(name))
+
+            rec = self._blank_event()
+            rec.update(
+                {
+                    "event_type": event_type,
+                    "name": name,
+                    "simple_name": self._simple_name(name),
+                    "start_ns": start,
+                    "end_ns": end,
+                    "duration_ns": duration,
+                    "stream_id": self._value(row, cols, ["streamId", "stream_id", "stream"]),
+                    "device_id": self._value(row, cols, ["deviceId", "device_id", "device"]),
+                    "context_id": self._value(row, cols, ["contextId", "context_id", "context"]),
+                    "process_id": self._value(row, cols, ["globalPid", "processId", "pid"]),
+                    "thread_id": self._value(row, cols, ["globalTid", "threadId", "tid"]),
+                    "correlation_id": correlation,
+                    "api_name": api_name,
+                    "grid_x": self._value(row, cols, ["gridX", "grid_x", "gridx"]),
+                    "grid_y": self._value(row, cols, ["gridY", "grid_y", "gridy"]),
+                    "grid_z": self._value(row, cols, ["gridZ", "grid_z", "gridz"]),
+                    "block_x": self._value(row, cols, ["blockX", "block_x", "blockx"]),
+                    "block_y": self._value(row, cols, ["blockY", "block_y", "blocky"]),
+                    "block_z": self._value(row, cols, ["blockZ", "block_z", "blockz"]),
+                    "bytes": bytes_value,
+                    "bytes_readable": self._bytes_readable(bytes_value),
+                    "copy_direction": copy_direction,
+                    "bandwidth_GBps": self._bandwidth(bytes_value, duration),
+                    "is_kernel": event_type == "kernel",
+                    "is_memcpy": event_type == "memcpy",
+                    "is_memset": event_type == "memset",
+                    "is_cuda_api": event_type == "cuda_api",
+                    "is_sync": is_sync,
+                    "is_allocation": is_allocation,
+                    "is_idle_gap": False,
+                    "kid_explanation": self._kid_explanation(event_type, name, copy_direction),
+                    "_source_table": table,
+                    "_source_row": int(idx),
+                }
+            )
+            records.append(rec)
+        return records
+
+    def _finalize_events(self, frame: pd.DataFrame) -> pd.DataFrame:
+        for col in NORMALIZED_COLUMNS:
+            if col not in frame.columns:
+                frame[col] = "N/A"
+        if frame.empty:
+            return frame[NORMALIZED_COLUMNS]
+
+        frame = frame.sort_values(["start_ns", "end_ns", "event_type"], kind="mergesort").reset_index(drop=True)
+        frame["event_id"] = [f"E{i + 1:06d}" for i in range(len(frame))]
+        frame["duration_us"] = pd.to_numeric(frame["duration_ns"], errors="coerce") / 1_000
+        frame["duration_ms"] = pd.to_numeric(frame["duration_ns"], errors="coerce") / 1_000_000
+        start_min = pd.to_numeric(frame["start_ns"], errors="coerce").min()
+        if pd.isna(start_min):
+            start_min = 0
+        frame["relative_start_ms"] = (pd.to_numeric(frame["start_ns"], errors="coerce") - start_min) / 1_000_000
+        frame["relative_end_ms"] = (pd.to_numeric(frame["end_ns"], errors="coerce") - start_min) / 1_000_000
+
+        api = frame[frame["is_cuda_api"] == True].copy()
+        api_by_corr: dict[Any, pd.Series] = {}
+        if not api.empty:
+            for _, row in api.iterrows():
+                corr = row.get("correlation_id")
+                if self._known(corr):
+                    api_by_corr[corr] = row
+
+        for idx, row in frame.iterrows():
+            if row["event_type"] in {"kernel", "memcpy", "memset"}:
+                corr = row.get("correlation_id")
+                linked = api_by_corr.get(corr)
+                if linked is not None:
+                    frame.at[idx, "api_name"] = linked.get("simple_name", linked.get("name", "N/A"))
+                    frame.at[idx, "linked_api_event_id"] = linked.get("event_id", "N/A")
+                    frame.at[idx, "api_start_ns"] = linked.get("start_ns", "N/A")
+                    frame.at[idx, "api_end_ns"] = linked.get("end_ns", "N/A")
+                    frame.at[idx, "api_duration_ns"] = linked.get("duration_ns", "N/A")
+                    delay = self._to_int(row.get("start_ns")) - self._to_int(linked.get("end_ns")) if self._to_int(linked.get("end_ns")) is not None else None
+                    if delay is not None:
+                        frame.at[idx, "launch_delay_ns"] = delay
+                        frame.at[idx, "launch_delay_ms"] = delay / 1_000_000
+
+        return frame[NORMALIZED_COLUMNS + [c for c in frame.columns if c.startswith("_")]]
+
+    def _event_name(self, table: str, event_type: str, row: pd.Series, cols: list[str]) -> str:
+        candidates = [
+            "demangledName",
+            "shortName",
+            "mangledName",
+            "name",
+            "nameId",
+            "text",
+            "message",
+            "messageId",
+            "eventName",
+            "label",
+            "symbolName",
+        ]
+        if event_type == "cuda_api":
+            candidates = ["name", "nameId", "cbid", "eventClass", "api", "functionName"] + candidates
+        value = self._value(row, cols, candidates)
+        resolved = self._resolve_name(value, table, event_type)
+        if self._known(resolved):
+            return str(resolved)
+        return {
+            "kernel": "Unnamed GPU kernel",
+            "memcpy": "GPU memory copy",
+            "memset": "GPU memset",
+            "cuda_api": "CUDA API call",
+            "nvtx": "NVTX range",
+        }.get(event_type, event_type)
+
+    def _resolve_name(self, value: Any, table: str, event_type: str) -> Any:
+        if not self._known(value):
+            return "N/A"
+        if isinstance(value, str) and not value.isdigit():
+            return value
+        for enum_table, mapping in self.enum_maps.items():
+            low = enum_table.lower()
+            if event_type == "cuda_api" and ("runtime" in low or "driver" in low or "cuda" in low):
+                if value in mapping:
+                    return mapping[value]
+        if value in self.string_maps:
+            return self.string_maps[value]
+        for mapping in self.enum_maps.values():
+            if value in mapping:
+                return mapping[value]
+        return value
+
+    def _copy_direction(self, table: str, row: pd.Series, cols: list[str]) -> str:
+        raw = self._value(row, cols, ["copyKind", "copy_kind", "memcpyKind", "kind", "flags"])
+        text = self._resolve_copy_kind(raw)
+        text_lower = str(text).lower()
+        if any(key in text_lower for key in ["host_to_device", "h2d", "htod"]):
+            return "H2D"
+        if any(key in text_lower for key in ["device_to_host", "d2h", "dtoh"]):
+            return "D2H"
+        if any(key in text_lower for key in ["device_to_device", "d2d", "dtod"]):
+            return "D2D"
+        if "peer" in text_lower or "p2p" in text_lower:
+            return "P2P"
+        if self._known(raw):
+            self.unavailable_fields.append(f"Copy direction in {table} could not be safely decoded from value {raw}.")
+        return "unknown"
+
+    def _resolve_copy_kind(self, raw: Any) -> Any:
+        if not self._known(raw):
+            return "unknown"
+        if isinstance(raw, str) and not raw.isdigit():
+            return raw
+        for enum_table, mapping in self.enum_maps.items():
+            low = enum_table.lower()
+            if "memcpy" in low or "copy" in low:
+                if raw in mapping:
+                    return mapping[raw]
+        return raw
+
+    def _blank_event(self) -> dict[str, Any]:
+        return {col: "N/A" for col in NORMALIZED_COLUMNS}
+
+    @staticmethod
+    def _quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    @staticmethod
+    def _pick(cols: list[str], names: list[str]) -> str | None:
+        lower = {c.lower(): c for c in cols}
+        for name in names:
+            if name.lower() in lower:
+                return lower[name.lower()]
+        compact = {re.sub(r"[^a-z0-9]", "", c.lower()): c for c in cols}
+        for name in names:
+            key = re.sub(r"[^a-z0-9]", "", name.lower())
+            if key in compact:
+                return compact[key]
+        return None
+
+    def _value(self, row: pd.Series, cols: list[str], names: list[str]) -> Any:
+        col = self._pick(cols, names)
+        if not col:
+            return "N/A"
+        value = row.get(col)
+        return "N/A" if pd.isna(value) else value
+
+    @staticmethod
+    def _to_int(value: Any) -> int | None:
+        if value is None or value == "N/A":
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _known(value: Any) -> bool:
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except TypeError:
+            pass
+        return str(value) not in {"", "N/A", "nan", "None"}
+
+    @staticmethod
+    def _simple_name(name: Any) -> str:
+        text = str(name) if name is not None else "N/A"
+        text = text.replace("void ", "").replace("__global__ ", "")
+        text = re.sub(r"\(.*\)$", "", text)
+        text = text.split("/")[-1]
+        if len(text) > 120:
+            text = text[:117] + "..."
+        return text or "N/A"
+
+    @staticmethod
+    def _bytes_readable(value: int | None) -> str:
+        if value is None:
+            return "N/A"
+        units = ["B", "KB", "MB", "GB", "TB"]
+        amount = float(value)
+        unit = 0
+        while amount >= 1024 and unit < len(units) - 1:
+            amount /= 1024
+            unit += 1
+        return f"{amount:.2f} {units[unit]}"
+
+    @staticmethod
+    def _bandwidth(bytes_value: int | None, duration_ns: int | None) -> Any:
+        if not bytes_value or not duration_ns or duration_ns <= 0:
+            return "N/A"
+        return (bytes_value / duration_ns)
+
+    @staticmethod
+    def _is_sync_api(name: Any) -> bool:
+        text = str(name).lower()
+        return "synchronize" in text or ("cudamemcpy" in text and "async" not in text)
+
+    @staticmethod
+    def _is_allocation_api(name: Any) -> bool:
+        text = str(name).lower()
+        return any(key in text for key in ["malloc", "free", "alloc"])
+
+    @staticmethod
+    def _kid_explanation(event_type: str, name: str, copy_direction: str) -> str:
+        if event_type == "kernel":
+            return "A kernel is a function running on the GPU."
+        if event_type == "memcpy":
+            if copy_direction == "H2D":
+                return "H2D means data moved from CPU memory to GPU memory."
+            if copy_direction == "D2H":
+                return "D2H means data moved from GPU memory back to CPU memory."
+            if copy_direction == "D2D":
+                return "D2D means data moved inside GPU memory."
+            return "A memory copy moves data for the GPU."
+        if event_type == "memset":
+            return "A memset fills GPU memory with a value."
+        if event_type == "cuda_api":
+            if NsightExtractor._is_sync_api(name):
+                return "Synchronization means something waited until earlier CUDA work finished."
+            return "CUDA API time is time spent in CUDA function calls on the CPU side."
+        if event_type == "nvtx":
+            return "NVTX is a named range added by the program to label timeline work."
+        return "Timeline event."

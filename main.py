@@ -1,40 +1,48 @@
-"""Command-line entry point for GPU Impact Analyser."""
-
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from analyzer import analyze, write_outputs
-from extractor import extract
-from visualizer import generate_timeline
+from analyzer import analyze_profile
+from extractor import NsightExtractor
+from html_report import render_html_report
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyse an exported Nsight Systems SQLite database.")
-    parser.add_argument("--sqlite", required=True, help="Path to SQLite file exported from Nsight Systems.")
-    parser.add_argument("--outdir", default=".", help="Output directory. Defaults to the current directory.")
+    parser = argparse.ArgumentParser(
+        description="Nsight Systems Analyzer: build one self-contained HTML report from an exported Nsight Systems SQLite database."
+    )
+    parser.add_argument("--sqlite", required=True, type=Path, help="Path to profile.sqlite exported with: nsys export -t sqlite profile.nsys-rep")
+    parser.add_argument("--output", required=True, type=Path, help="Output HTML file, for example report.html")
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    sqlite_path = args.sqlite.expanduser()
+    output_path = args.output.expanduser()
 
-    extraction = extract(args.sqlite)
-    for warning in extraction.warnings:
-        print(f"warning: {warning}")
+    if not sqlite_path.exists():
+        print(f"Error: SQLite file does not exist: {sqlite_path}", file=sys.stderr)
+        return 2
+    if sqlite_path.is_dir():
+        print(f"Error: SQLite path is a directory, not a file: {sqlite_path}", file=sys.stderr)
+        return 2
 
-    result = analyze(extraction)
-    csv_path, report_path = write_outputs(result, outdir)
-    timeline_path = generate_timeline(result.events, outdir)
+    try:
+        extraction = NsightExtractor(sqlite_path).extract()
+        analysis = analyze_profile(extraction)
+        html = render_html_report(analysis)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(html, encoding="utf-8")
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
-    print("GPU Impact Analyser complete.")
-    print(f"CSV: {csv_path}")
-    print(f"Timeline: {timeline_path}")
-    print(f"Report: {report_path}")
+    print(f"Report generated: {output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
