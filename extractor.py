@@ -63,6 +63,12 @@ NORMALIZED_COLUMNS = [
     "time_percent_of_gpu_activity",
     "bottleneck_tags",
     "kid_explanation",
+    "arguments",
+    "source_table",
+    "registers_per_thread",
+    "static_shared_memory",
+    "dynamic_shared_memory",
+    "local_memory",
 ]
 
 
@@ -191,7 +197,7 @@ class NsightExtractor:
             if name.startswith("enum") or name.startswith("sqlite_"):
                 continue
             if category == "api":
-                if ("runtime" in name and ("cupti" in name or "cuda" in name)) or "cuda_api" in name or "api_call" in name:
+                if ("runtime" in name and ("cupti" in name or "cuda" in name)) or "cuda_api" in name or "api_call" in name or name == "osrt_api" or name.startswith("osrt_"):
                     found.append(table)
             elif category == "kernel":
                 if "kernel" in name and ("activity" in name or "cupti" in name or "gpu" in name):
@@ -246,6 +252,7 @@ class NsightExtractor:
             api_name = name if event_type == "cuda_api" else "N/A"
             is_sync = bool(event_type == "cuda_api" and self._is_sync_api(name))
             is_allocation = bool(event_type == "cuda_api" and self._is_allocation_api(name))
+            arguments = self._arguments(row, cols)
 
             rec = self._blank_event()
             rec.update(
@@ -281,6 +288,12 @@ class NsightExtractor:
                     "is_allocation": is_allocation,
                     "is_idle_gap": False,
                     "kid_explanation": self._kid_explanation(event_type, name, copy_direction),
+                    "arguments": arguments,
+                    "source_table": table,
+                    "registers_per_thread": self._value(row, cols, ["registersPerThread", "registers", "regsPerThread"]),
+                    "static_shared_memory": self._value(row, cols, ["staticSharedMemory", "staticSharedMemoryBytes"]),
+                    "dynamic_shared_memory": self._value(row, cols, ["dynamicSharedMemory", "dynamicSharedMemoryBytes"]),
+                    "local_memory": self._value(row, cols, ["localMemoryTotal", "localMemoryPerThread", "localMemory"]),
                     "_source_table": table,
                     "_source_row": int(idx),
                 }
@@ -350,7 +363,7 @@ class NsightExtractor:
             "symbolName",
         ]
         if event_type == "cuda_api":
-            candidates = ["name", "nameId", "cbid", "cbId", "eventClass", "api", "functionName", "runtimeName"] + candidates
+            candidates = ["name", "nameId", "cbid", "cbId", "eventClass", "api", "functionName", "runtimeName", "callName", "callNameId"] + candidates
         numeric_fallback: Any = None
         for candidate in candidates:
             value = self._value(row, cols, [candidate])
@@ -487,6 +500,44 @@ class NsightExtractor:
             return "N/A"
         value = row.get(col)
         return "N/A" if pd.isna(value) else value
+
+    def _arguments(self, row: pd.Series, cols: list[str]) -> str:
+        direct = self._value(row, cols, ["arguments", "args", "params", "parameter", "details"])
+        if self._known(direct):
+            return str(direct)
+        skip = {
+            "start",
+            "end",
+            "duration",
+            "globaltid",
+            "globalpid",
+            "tid",
+            "pid",
+            "correlationid",
+            "name",
+            "nameid",
+            "cbid",
+            "cbid",
+            "shortname",
+            "shortnameid",
+            "demangledname",
+            "demanglednameid",
+        }
+        pieces = []
+        for col in cols:
+            key = re.sub(r"[^a-z0-9]", "", col.lower())
+            if key in skip:
+                continue
+            value = row.get(col)
+            try:
+                if pd.isna(value):
+                    continue
+            except TypeError:
+                pass
+            pieces.append(f"{col}={value}")
+            if len(pieces) >= 10:
+                break
+        return "; ".join(pieces) if pieces else "N/A"
 
     @staticmethod
     def _to_int(value: Any) -> int | None:

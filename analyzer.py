@@ -309,13 +309,26 @@ def _grid_block(rows: pd.DataFrame, prefix: str) -> list[str]:
 
 def _api_summary(api: pd.DataFrame) -> pd.DataFrame:
     if api.empty:
-        return pd.DataFrame(columns=["rank", "api_name", "calls", "total_ms", "avg_ms", "max_ms", "category", "simple_meaning"])
-    grouped = api.groupby("name", dropna=False).agg(calls=("event_id", "count"), total_ns=("duration_ns", "sum"), avg_ns=("duration_ns", "mean"), max_ns=("duration_ns", "max")).reset_index()
+        return pd.DataFrame(columns=["rank", "api_name", "calls", "percent_time", "total_ms", "avg_ms", "median_ms", "min_ms", "max_ms", "std_ms", "category", "simple_meaning"])
+    total_api_ns = max(api["duration_ns"].sum(), 1)
+    grouped = api.groupby("name", dropna=False).agg(
+        calls=("event_id", "count"),
+        total_ns=("duration_ns", "sum"),
+        avg_ns=("duration_ns", "mean"),
+        median_ns=("duration_ns", "median"),
+        min_ns=("duration_ns", "min"),
+        max_ns=("duration_ns", "max"),
+        std_ns=("duration_ns", "std"),
+    ).reset_index()
     grouped = grouped.rename(columns={"name": "api_name"}).sort_values("total_ns", ascending=False).reset_index(drop=True)
     grouped["rank"] = np.arange(1, len(grouped) + 1)
+    grouped["percent_time"] = grouped["total_ns"] / total_api_ns * 100
     grouped["total_ms"] = grouped["total_ns"] / 1_000_000
     grouped["avg_ms"] = grouped["avg_ns"] / 1_000_000
+    grouped["median_ms"] = grouped["median_ns"] / 1_000_000
+    grouped["min_ms"] = grouped["min_ns"] / 1_000_000
     grouped["max_ms"] = grouped["max_ns"] / 1_000_000
+    grouped["std_ms"] = grouped["std_ns"].fillna(0) / 1_000_000
     grouped["category"] = grouped["api_name"].map(_api_category)
     grouped["simple_meaning"] = grouped["category"].map(
         {
@@ -326,7 +339,7 @@ def _api_summary(api: pd.DataFrame) -> pd.DataFrame:
             "Memset": "The CPU asked CUDA to fill memory.",
         }
     ).fillna("CUDA call measured on the CPU side.")
-    return grouped[["rank", "api_name", "calls", "total_ms", "avg_ms", "max_ms", "category", "simple_meaning"]]
+    return grouped[["rank", "api_name", "calls", "percent_time", "total_ms", "avg_ms", "median_ms", "min_ms", "max_ms", "std_ms", "category", "simple_meaning"]]
 
 
 def _stream_summary(events: pd.DataFrame, total_ns: int) -> pd.DataFrame:
